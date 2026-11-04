@@ -1,5 +1,6 @@
 import { spawn, type SpawnOptions } from "child_process";
 import { Transform, type TransformCallback, pipeline, PassThrough, type Readable } from "stream";
+import { StringDecoder } from "string_decoder";
 import {
   config as fieldsConfig,
   map as fieldsMap,
@@ -8,6 +9,7 @@ import {
 } from "./fields.js";
 
 const END = "\x1e";
+const RECORD_SEP = "\x1e\n";
 const FIELD = "\x1f";
 
 function camelToKebab(str: string): string {
@@ -29,12 +31,11 @@ function spawnGit(args: string[], options: SpawnOptions = {}): Readable {
   const child = spawn("git", args, options);
   const stdout = new PassThrough();
   let stderrData = "";
-  const MAX_STDERR = 1024 * 10; // todo: evaluate if i even need this
+  const MAX_STDERR = 1024 * 10;
 
-  child.stderr?.on("data", (chunk) => {
-    const chunkStr = chunk.toString("utf8");
+  child.stderr?.on("data", (chunk: Buffer) => {
     if (stderrData.length < MAX_STDERR) {
-      stderrData += chunkStr.slice(0, MAX_STDERR - stderrData.length);
+      stderrData += chunk.toString("utf8", 0, MAX_STDERR - stderrData.length);
     }
   });
 
@@ -50,27 +51,6 @@ function spawnGit(args: string[], options: SpawnOptions = {}): Readable {
   });
 
   return stdout;
-}
-
-function createSplitter(delimiter: string): Transform {
-  let buffer = "";
-  return new Transform({
-    transform(chunk: Buffer, enc, callback: TransformCallback) {
-      buffer += chunk.toString("utf8");
-      let idx;
-      while ((idx = buffer.indexOf(delimiter)) !== -1) {
-        this.push(buffer.slice(0, idx));
-        buffer = buffer.slice(idx + delimiter.length);
-      }
-      callback();
-    },
-    flush(callback: TransformCallback) {
-      if (buffer.trim()) {
-        this.push(buffer);
-      }
-      callback();
-    },
-  });
 }
 
 interface ParsedObject {
@@ -95,20 +75,52 @@ function setPath(obj: Record<string, ParsedValue>, path: string[], value: Parsed
   current[path[path.length - 1]] = value;
 }
 
+function parseRecord(raw: string, fieldMap: MappedField[]): Record<string, ParsedValue> {
+  const parsed: Record<string, ParsedValue> = {};
+  let start = 0;
+
+  for (let i = 0; i < fieldMap.length; i++) {
+    const field = fieldMap[i];
+    let value = "";
+    if (start <= raw.length) {
+      const next = raw.indexOf(FIELD, start);
+      if (next === -1) {
+        value = raw.slice(start);
+        start = raw.length + 1;
+      } else {
+        value = raw.slice(start, next);
+        start = next + 1;
+      }
+    }
+    setPath(parsed, field.path, field.type ? new field.type(value) : value);
+  }
+
+  return parsed;
+}
+
 function createParser(fieldMap: MappedField[]): Transform {
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+
   return new Transform({
-    objectMode: true,
-    transform(chunk: Buffer, enc, callback: TransformCallback) {
-      const fieldValues = chunk.toString("utf8").split(FIELD);
-      const parsed: Record<string, ParsedValue> = {};
-
-      fieldMap.forEach((field, index) => {
-        const value = fieldValues[index] ?? "";
-        const finalValue: ParsedValue = field.type ? new field.type(value) : value;
-        setPath(parsed, field.path, finalValue);
-      });
-
-      callback(null, parsed);
+    readableObjectMode: true,
+    transform(chunk: Buffer, _enc, callback: TransformCallback) {
+      buffer += decoder.write(chunk);
+      let start = 0;
+      let idx: number;
+      while ((idx = buffer.indexOf(RECORD_SEP, start)) !== -1) {
+        this.push(parseRecord(buffer.slice(start, idx), fieldMap));
+        start = idx + RECORD_SEP.length;
+      }
+      if (start > 0) buffer = buffer.slice(start);
+      callback();
+    },
+    flush(callback: TransformCallback) {
+      buffer += decoder.end();
+      if (buffer.trim()) {
+        this.push(parseRecord(buffer, fieldMap));
+      }
+      callback();
     },
   });
 }
@@ -120,20 +132,13 @@ export function parseLogStream(
   const fieldMap = fieldsMap();
   const format = fieldMap.map((f) => `%${f.key}`).join(FIELD) + END;
   const args = ["log", ...formatArgs({ ...config, format })];
+  const parser = createParser(fieldMap);
 
-  const output = new PassThrough({ objectMode: true });
+  pipeline(spawnGit(args, options), parser, (err) => {
+    if (err) parser.destroy(err);
+  });
 
-  pipeline(
-    spawnGit(args, options),
-    createSplitter(END + "\n"),
-    createParser(fieldMap),
-    output,
-    (err) => {
-      if (err) output.destroy(err);
-    },
-  );
-
-  return output;
+  return parser;
 }
 
 export const fields: FieldConfigObject = fieldsConfig;

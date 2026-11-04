@@ -53,7 +53,7 @@ export function map(obj: FieldConfigObject = config, currentPath: string[] = [])
           type: typeof obj.type === "function" ? (obj.type as FieldType) : undefined,
         });
       } else {
-        fields.push({ path, key: value });
+        fields.push({ path, key: value, type: undefined });
       }
     } else if (value && typeof value === "object") {
       fields.push(...map(value as FieldConfigObject, path));
